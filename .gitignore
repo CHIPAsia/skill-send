@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+*.log
+
+# Installer output — regenerated on demand by `node bin/install.cjs`.
+# Do not commit: it would silently go stale whenever SKILL.md changes.
+chip-skill-send/
