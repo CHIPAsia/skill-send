@@ -425,11 +425,20 @@ create a second recipient or send a second payout.
 
 ## Step 4 — Webhooks (recommended for production)
 
-Configure a webhook in
-[CHIP Control → Settings → Applications](https://portal.chip-in.asia/control/settings/applications).
-CHIP Send will POST to your callback URL for events like
-`send_instruction.created`, `send_instruction.completed`,
-`bank_account.verified`, etc.
+Register a webhook with `POST /api/webhooks`, passing `callback_url`,
+`email`, and one or more `event_hooks` from this closed set:
+
+| `event_hooks` value | Emitted when |
+|---|---|
+| `bank_account_status` | A recipient bank account's status changes (CHIP verifies the account) |
+| `send_instruction_status` | A send instruction's status changes (CHIP processes it with the bank) |
+| `budget_allocation_status` | A budget allocation is approved |
+
+That enum is the complete list — there are no `send_instruction.created`
+or `bank_account.verified` event names, and any other value is rejected.
+CHIP Send then POSTs the affected resource (with its current `state`) to
+your `callback_url`, with an `Event-Type` header carrying the matching
+`event_hooks` value.
 
 > Use webhooks as the **source of truth** for state transitions.
 > Polling `GET /send/send_instructions/{id}` works but is rate-limited
@@ -439,31 +448,38 @@ CHIP Send will POST to your callback URL for events like
 
 ## Step 5 — Webhook Signature Verification
 
-CHIP Send webhook payloads are signed. **The signature scheme is
-the same as the API auth** — `HMAC-SHA512`, keyed on your
-`api_secret`, encoded as **hex**. This is *different* from CHIP
-Collect, which uses RSA-SHA512 with Base64 encoding. Don't reuse
-Collect verification code on Send.
+CHIP Send webhook payloads are signed with **RSA PKCS#1 v1.5 over a
+SHA-512 digest**, base64-encoded, using a **per-webhook public key**.
+It is *not* HMAC, and it does *not* use your `api_secret` — the API
+auth `checksum` scheme is a different thing entirely.
 
-**Algorithm (matches the description in the [OpenAPI spec](https://docs.chip-in.asia/openapi/chip-send.yaml) and the [rendered reference](https://docs.chip-in.asia/chip-send/api-reference/introduction)):**
+**Algorithm:**
 
 | Property | Value |
 |---|---|
 | Header | `X-Signature` |
-| Algorithm | `HMAC-SHA512` |
-| Encoding | **hex** (lowercase, 128 chars) |
-| Key | Your `api_secret` (the same value used for API auth) |
+| Algorithm | `RSA` PKCS#1 v1.5 over a `SHA-512` digest |
+| Encoding | **base64** of the raw signature bytes |
+| Key | The `public_key` (PEM string) of **that webhook** — `GET /api/webhooks/{id}` |
 | Signed payload | The **raw request body** as bytes (not the parsed JSON) |
-| Library (Node.js) | `crypto.createHmac('sha512', api_secret).update(rawBody).digest('hex')` |
-| Library (Python) | `hmac.new(api_secret.encode(), raw_body, hashlib.sha512).hexdigest()` |
+
+Two things bite integrators here:
+
+- **The verification key is per webhook.** `GET /api/webhooks` and
+  `GET /api/webhooks/{id}` both return `public_key`; keep it alongside the
+  webhook id. There is no account-wide webhook key to fetch (the
+  `/public_key/` endpoint belongs to CHIP Collect's success callbacks).
+- **The digest is SHA-512.** Most crypto helpers default to SHA-256, and
+  CHIP Collect's documented callback digest is SHA-256 — pass SHA-512
+  explicitly or every verification fails.
 
 **Verification logic (pseudocode):**
 
 ```
 1. Read the raw request body as bytes — do NOT parse JSON first
-2. Compute: expected = HEX( HMAC_SHA512( api_secret, body ) )
-3. Compare expected to the X-Signature header in constant time
-4. If they don't match -> return HTTP 200 but skip processing
+2. Base64-decode the X-Signature header into signature bytes
+3. Verify: RSA_PKCS1v1_5_SHA512_verify(public_key, body, signature)
+4. If it fails -> return HTTP 200 but skip processing
    (returning 4xx causes CHIP to retry; you want silent rejection)
 ```
 
@@ -479,16 +495,15 @@ Collect verification code on Send.
 ```js
 const crypto = require('crypto');
 
-function verifySignature(rawBody, signatureHeader, apiSecret) {
-  const expected = crypto
-    .createHmac('sha512', apiSecret)
-    .update(rawBody)  // rawBody must be a Buffer, not a parsed object
-    .digest('hex');
-
-  // Constant-time comparison to avoid timing attacks
-  return crypto.timingSafeEqual(
-    Buffer.from(expected, 'hex'),
-    Buffer.from(signatureHeader, 'hex')
+// webhookPublicKeyPem: `public_key` from GET /api/webhooks/{id}
+// signatureHeader:     the X-Signature header value
+// rawBody:             Buffer of the exact bytes received, before JSON.parse
+function verifySignature(rawBody, signatureHeader, webhookPublicKeyPem) {
+  return crypto.verify(
+    'sha512',
+    rawBody,
+    { key: webhookPublicKeyPem, padding: crypto.constants.RSA_PKCS1_PADDING },
+    Buffer.from(signatureHeader, 'base64')
   );
 }
 ```
@@ -496,15 +511,22 @@ function verifySignature(rawBody, signatureHeader, apiSecret) {
 **Python example:**
 
 ```python
-import hmac, hashlib
+import base64
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 
-def chip_send_signature_valid(raw_body: bytes, signature_header: str, api_secret: str) -> bool:
-    expected = hmac.new(
-        api_secret.encode(),
-        raw_body,
-        hashlib.sha512
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+def chip_send_signature_valid(raw_body: bytes, signature_header: str, webhook_public_key_pem: str) -> bool:
+    public_key = serialization.load_pem_public_key(webhook_public_key_pem.encode())
+    try:
+        public_key.verify(
+            base64.b64decode(signature_header),
+            raw_body,
+            padding.PKCS1v15(),
+            hashes.SHA512(),
+        )
+        return True
+    except Exception:
+        return False
 ```
 
 > If your framework auto-parses the body (Express, FastAPI, etc.),
@@ -512,6 +534,9 @@ def chip_send_signature_valid(raw_body: bytes, signature_header: str, api_secret
 > use `express.raw({ type: 'application/json' })` and call
 > `JSON.parse(rawBody)` after verification. In FastAPI, read
 > `await request.body()` before any Pydantic model parsing.
+
+Canonical reference:
+[Validating Webhooks](https://docs.chip-in.asia/chip-send/api-reference/webhooks/validation).
 
 ---
 
