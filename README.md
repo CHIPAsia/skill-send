@@ -12,7 +12,7 @@ the merchant installs the skill into their project.
 npx -y github:CHIPAsia/skill-send
 
 # Pinned to a specific tag (recommended for production)
-npx -y github:CHIPAsia/skill-send#v0.1.0
+npx -y github:CHIPAsia/skill-send#v0.1.1
 
 # Pinned to a specific commit
 npx -y github:CHIPAsia/skill-send#<commit-sha>
