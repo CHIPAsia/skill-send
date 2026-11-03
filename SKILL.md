@@ -95,11 +95,12 @@ returns `401 Unauthorized`.
 | `epoch` | Current Unix timestamp in seconds (e.g. `1689826456`) |
 | `checksum` | Hex-encoded HMAC-SHA512 of the signing string, computed with the API Secret |
 
-**Clock skew:** the `epoch` value must be within **30 seconds** of
-the server's clock. If it's too old or too far in the future, the
-request is rejected as `Unauthorized`. The merchant's server clock
-must be synchronised (NTP, chrony, or your cloud provider's time
-service).
+**Clock skew:** the `epoch` value must be close to the server's clock.
+A request is rejected as `401 Unauthorized` (`Epoch Timeout`) when
+`epoch` is more than **120 seconds in the past** or more than **60
+seconds in the future**; the public docs quote 30 seconds as the safe
+bound, so aim for that. The merchant's server clock must be synchronised
+(NTP, chrony, or your cloud provider's time service).
 
 ### How to compute the checksum
 
@@ -425,23 +426,39 @@ create a second recipient or send a second payout.
 
 ## Step 4 — Webhooks (recommended for production)
 
-Register a webhook with `POST /api/webhooks`, passing `callback_url`,
-`email`, and one or more `event_hooks` from this closed set:
+Register a webhook with `POST /api/webhooks`. All four fields are
+required: `name`, `callback_url`, `email`, and one or more `event_hooks`.
 
 | `event_hooks` value | Emitted when |
 |---|---|
 | `bank_account_status` | A recipient bank account's status changes (CHIP verifies the account) |
 | `send_instruction_status` | A send instruction's status changes (CHIP processes it with the bank) |
-| `budget_allocation_status` | A budget allocation is approved |
+| `budget_allocation_status` | A budget allocation's status changes — emitted when the approvers approve the increment |
+
+```json
+POST /api/webhooks
+{
+  "name": "Send Instruction Notifications",
+  "callback_url": "https://api.merchant.example/webhooks/chip-send",
+  "email": "ops@merchant.example",
+  "event_hooks": ["send_instruction_status", "bank_account_status"]
+}
+```
+
+`email` receives a notice when a delivery keeps failing, so use a mailbox
+someone actually reads.
 
 That enum is the complete list — there are no `send_instruction.created`
 or `bank_account.verified` event names, and any other value is rejected.
-CHIP Send then POSTs the affected resource (with its current `state`) to
-your `callback_url`, with an `Event-Type` header carrying the matching
-`event_hooks` value.
+
+Each delivery POSTs the affected resource (with its current `state`) to
+your `callback_url`. The request also carries an `Event-Type` header with
+the matching `event_hooks` value — handy for routing, but treat the
+payload's own `state` as the source of truth rather than relying on the
+header alone.
 
 > Use webhooks as the **source of truth** for state transitions.
-> Polling `GET /send/send_instructions/{id}` works but is rate-limited
+> Polling `GET /api/send/send_instructions/{id}` works but is rate-limited
 > and stale by design (the list endpoint is cached for an hour).
 
 ---
@@ -466,9 +483,11 @@ auth `checksum` scheme is a different thing entirely.
 Two things bite integrators here:
 
 - **The verification key is per webhook.** `GET /api/webhooks` and
-  `GET /api/webhooks/{id}` both return `public_key`; keep it alongside the
-  webhook id. There is no account-wide webhook key to fetch (the
-  `/public_key/` endpoint belongs to CHIP Collect's success callbacks).
+  `GET /api/webhooks/{id}` both return `public_key`; cache it by webhook id
+  instead of fetching it per delivery. If a webhook is deleted and created
+  again it gets a **new** key pair, so re-fetch rather than reuse the old
+  PEM. There is no account-wide webhook key (the `/public_key/` endpoint
+  belongs to CHIP Collect's success callbacks).
 - **The digest is SHA-512.** Most crypto helpers default to SHA-256, and
   CHIP Collect's documented callback digest is SHA-256 — pass SHA-512
   explicitly or every verification fails.
@@ -479,16 +498,10 @@ Two things bite integrators here:
 1. Read the raw request body as bytes — do NOT parse JSON first
 2. Base64-decode the X-Signature header into signature bytes
 3. Verify: RSA_PKCS1v1_5_SHA512_verify(public_key, body, signature)
-4. If it fails -> return HTTP 200 but skip processing
-   (returning 4xx causes CHIP to retry; you want silent rejection)
+4. If it fails -> return HTTP 200 but skip processing. Failed deliveries are
+   retried (25 attempts over ~3 weeks — see the delivery protocol page), so a
+   4xx just buys you retries you don't want.
 ```
-
-> ⚠️ **Clock skew tolerance is 120 seconds in the past, 60
-> seconds in the future** on the inbound side (the merchant's
-> request to CHIP, not the webhook delivery). Plan your NTP
-> accordingly. The Send OpenAPI spec advertises 30 seconds; the
-> actual tolerance is more generous. Either is safe — the
-> difference matters only when debugging.
 
 **Node.js example:**
 
@@ -499,6 +512,7 @@ const crypto = require('crypto');
 // signatureHeader:     the X-Signature header value
 // rawBody:             Buffer of the exact bytes received, before JSON.parse
 function verifySignature(rawBody, signatureHeader, webhookPublicKeyPem) {
+  if (!signatureHeader) return false;
   return crypto.verify(
     'sha512',
     rawBody,
@@ -512,21 +526,27 @@ function verifySignature(rawBody, signatureHeader, webhookPublicKeyPem) {
 
 ```python
 import base64
+import binascii
+
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+
 def chip_send_signature_valid(raw_body: bytes, signature_header: str, webhook_public_key_pem: str) -> bool:
+    # A malformed key is a deployment error, not a failed verification: let it raise.
     public_key = serialization.load_pem_public_key(webhook_public_key_pem.encode())
+
     try:
-        public_key.verify(
-            base64.b64decode(signature_header),
-            raw_body,
-            padding.PKCS1v15(),
-            hashes.SHA512(),
-        )
-        return True
-    except Exception:
+        signature = base64.b64decode(signature_header, validate=True)
+    except (binascii.Error, ValueError):
         return False
+
+    try:
+        public_key.verify(signature, raw_body, padding.PKCS1v15(), hashes.SHA512())
+    except InvalidSignature:
+        return False
+    return True
 ```
 
 > If your framework auto-parses the body (Express, FastAPI, etc.),
